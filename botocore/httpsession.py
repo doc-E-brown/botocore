@@ -1,17 +1,20 @@
-import os.path
+import datetime
+import json
 import logging
+import os.path
 import socket
 from base64 import b64encode
 
-from urllib3 import PoolManager, ProxyManager, proxy_from_url, Timeout
-from urllib3.util.retry import Retry
-from urllib3.util.ssl_ import (
-    ssl, OP_NO_SSLv2, OP_NO_SSLv3, OP_NO_COMPRESSION, DEFAULT_CIPHERS,
-)
-from urllib3.exceptions import SSLError as URLLib3SSLError
-from urllib3.exceptions import ReadTimeoutError as URLLib3ReadTimeoutError
-from urllib3.exceptions import ConnectTimeoutError as URLLib3ConnectTimeoutError
+from urllib3 import PoolManager, ProxyManager, Timeout, proxy_from_url
+from urllib3.exceptions import \
+    ConnectTimeoutError as URLLib3ConnectTimeoutError
 from urllib3.exceptions import NewConnectionError, ProtocolError, ProxyError
+from urllib3.exceptions import ReadTimeoutError as URLLib3ReadTimeoutError
+from urllib3.exceptions import SSLError as URLLib3SSLError
+from urllib3.util.retry import Retry
+from urllib3.util.ssl_ import (DEFAULT_CIPHERS, OP_NO_COMPRESSION, OP_NO_SSLv2,
+                               OP_NO_SSLv3, ssl)
+
 try:
     # Always import the original SSLContext, even if it has been patched
     from urllib3.contrib.pyopenssl import orig_util_SSLContext as SSLContext
@@ -19,14 +22,14 @@ except ImportError:
     from urllib3.util.ssl_ import SSLContext
 
 import botocore.awsrequest
+from botocore.compat import filter_ssl_warnings, urlparse
+from botocore.exceptions import (ConnectionClosedError, ConnectTimeoutError,
+                                 EndpointConnectionError, HTTPClientError,
+                                 InvalidProxiesConfigError,
+                                 ProxyConnectionError, ReadTimeoutError,
+                                 SSLError)
 from botocore.vendored import six
 from botocore.vendored.six.moves.urllib_parse import unquote
-from botocore.compat import filter_ssl_warnings, urlparse
-from botocore.exceptions import (
-    ConnectionClosedError, EndpointConnectionError, HTTPClientError,
-    ReadTimeoutError, ProxyConnectionError, ConnectTimeoutError, SSLError,
-    InvalidProxiesConfigError
-)
 
 filter_ssl_warnings()
 logger = logging.getLogger(__name__)
@@ -37,6 +40,7 @@ DEFAULT_CA_BUNDLE = os.path.join(os.path.dirname(__file__), 'cacert.pem')
 try:
     from certifi import where
 except ImportError:
+
     def where():
         return DEFAULT_CA_BUNDLE
 
@@ -51,8 +55,10 @@ def get_cert_path(verify):
     return cert_path
 
 
-def create_urllib3_context(ssl_version=None, cert_reqs=None,
-                           options=None, ciphers=None):
+def create_urllib3_context(ssl_version=None,
+                           cert_reqs=None,
+                           options=None,
+                           ciphers=None):
     """ This function is a vendored version of the same function in urllib3
 
         We vendor this function to ensure that the SSL contexts we construct
@@ -157,18 +163,19 @@ class URLLib3Session(object):
     v2.7.0 implemented this themselves, later version urllib3 support this
     directly via a flag to urlopen so enabling it if needed should be trivial.
     """
-    def __init__(self,
-                 verify=True,
-                 proxies=None,
-                 timeout=None,
-                 max_pool_connections=MAX_POOL_CONNECTIONS,
-                 socket_options=None,
-                 client_cert=None,
-                 proxies_config=None,
+    def __init__(
+        self,
+        verify=True,
+        proxies=None,
+        timeout=None,
+        max_pool_connections=MAX_POOL_CONNECTIONS,
+        socket_options=None,
+        client_cert=None,
+        proxies_config=None,
     ):
         self._verify = verify
-        self._proxy_config = ProxyConfiguration(proxies=proxies,
-                                                proxies_settings=proxies_config)
+        self._proxy_config = ProxyConfiguration(
+            proxies=proxies, proxies_settings=proxies_config)
         self._pool_classes_by_scheme = {
             'http': botocore.awsrequest.AWSHTTPConnectionPool,
             'https': botocore.awsrequest.AWSHTTPSConnectionPool,
@@ -199,9 +206,10 @@ class URLLib3Session(object):
         proxies_settings = self._proxy_config.settings
         proxy_ssl_context = self._setup_proxy_ssl_context(proxies_settings)
         proxies_kwargs = {
-            'proxy_ssl_context': proxy_ssl_context,
-            'use_forwarding_for_https': proxies_settings.get(
-                'proxy_use_forwarding_for_https'),
+            'proxy_ssl_context':
+            proxy_ssl_context,
+            'use_forwarding_for_https':
+            proxies_settings.get('proxy_use_forwarding_for_https'),
         }
         return {k: v for k, v in proxies_kwargs.items() if v is not None}
 
@@ -287,10 +295,9 @@ class URLLib3Session(object):
         # which host to establish a connection to. urllib3 also supports
         # forwarding for HTTPS through the 'use_forwarding_for_https' parameter.
         proxy_scheme = urlparse(proxy_url).scheme
-        using_https_forwarding_proxy = (
-            proxy_scheme == 'https' and
-            self._proxies_kwargs.get('use_forwarding_for_https', False)
-        )
+        using_https_forwarding_proxy = (proxy_scheme == 'https'
+                                        and self._proxies_kwargs.get(
+                                            'use_forwarding_for_https', False))
 
         if using_https_forwarding_proxy or url.startswith('http:'):
             return url
@@ -320,6 +327,34 @@ class URLLib3Session(object):
                 chunked=self._chunked(request.headers),
             )
 
+            request_headers = {}
+            for item, value in request.headers.items():
+                request_headers[item] = value.decode() if isinstance(
+                    value, bytes) else value
+
+            urllib_headers = {}
+            for item, value in urllib_response.headers.items():
+                urllib_headers[item] = value
+
+            log_record = {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'message': {
+                    'method': request.method,
+                    'url': request.url,
+                    'headers': request_headers,
+                    'urllib_response': {
+                        'status':
+                        urllib_response.status,
+                        'headers':
+                        urllib_headers,
+                        'response_stream':
+                        bytes().join(urllib_response.stream()).decode()
+                    }
+                }
+            }
+
+            print(json.dumps(log_record))
+
             http_response = botocore.awsrequest.AWSResponse(
                 request.url,
                 urllib_response.status,
@@ -345,11 +380,9 @@ class URLLib3Session(object):
         except URLLib3ReadTimeoutError as e:
             raise ReadTimeoutError(endpoint_url=request.url, error=e)
         except ProtocolError as e:
-            raise ConnectionClosedError(
-                error=e,
-                request=request,
-                endpoint_url=request.url
-            )
+            raise ConnectionClosedError(error=e,
+                                        request=request,
+                                        endpoint_url=request.url)
         except Exception as e:
             message = 'Exception received when sending urllib3 HTTP request'
             logger.debug(message, exc_info=True)
